@@ -200,7 +200,7 @@ function BatchIterator:nextTraining(count)
     local positive = self.anchors:findPositive(rois, img_rect, cfg.positive_threshold, cfg.negative_threshold, cfg.best_match)
 
     -- random negative examples
-    local negative = self.anchors:sampleNegative(img_rect, rois, cfg.negative_threshold, 1) --20160306 16
+    local negative = self.anchors:sampleNegative(img_rect, rois, cfg.negative_threshold, math.ceil(#positive/2)) --20160306 16
     local count = #positive + #negative
 
     if cfg.nearby_aversion then
