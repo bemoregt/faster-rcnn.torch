@@ -1,17 +1,17 @@
-require 'torch'
-require 'pl'
-require 'optim'
-require 'image'
-require 'nngraph'
-require 'cunn'
-require 'nms'
-require 'gnuplot'
+local torch = require 'torch'
+local pl = require 'pl'
+local optim = require 'optim'
+local image = require 'image'
+local nngraph = require 'nngraph'
+local cunn = require 'cunn'
+local nms = require 'nms'
+local gnuplot = require 'gnuplot'
 
-require 'utilities'
-require 'Anchors'
+local utilities = require 'utilities'
+local Anchors = require 'Anchors'
 require 'BatchIterator'
-require 'objective_onlyPnetCLS'
 require 'Detector'
+require 'objective_onlyPnetCLS'
 local c = require 'trepl.colorize'
 
 -- command line options
@@ -31,7 +31,7 @@ cmd:option('-restore', '', 'network snapshot file name to load')
 cmd:option('-snapshot', 1000, 'snapshot interval')
 cmd:option('-plot', 100, 'plot training progress interval')
 cmd:option('-lr', 1E-4, 'learn rate')
-cmd:option('-rms_decay', 0.95, 'RMSprop moving average dissolving factor')
+cmd:option('-rms_decay', 0.98, 'RMSprop moving average dissolving factor')
 cmd:option('-opti', 'rmsprop', 'Optimizer')
 cmd:option('-resultDir', 'logs', 'Folder for storing all result. (training process ect)')
 
@@ -49,10 +49,18 @@ local cfg = dofile(opt.cfg)
 print(cfg)
 
 os.execute(('mkdir -p %s'):format(opt.resultDir))
+paths.mkdir(opt.resultDir)
+--testLogger = optim.Logger(paths.concat(opt.resultDir, 'test.log'))
+--testLogger:setNames{'% mean class accuracy (train set)', '% mean class accuracy (test set)'}
+--testLogger.showPlot = false
 
+
+trainLogger = optim.Logger(paths.concat(opt.resultDir, 'train.log'))
+trainLogger.showPlot = false
+torch.setdefaulttensortype('torch.FloatTensor')
 local confusion = optim.ConfusionMatrix(2)
 -- system configuration
-torch.setdefaulttensortype('torch.FloatTensor')
+
 cutorch.setDevice(opt.gpuid + 1)  -- nvidia tools start counting at 0
 torch.setnumthreads(opt.threads)
 if opt.seed ~= 0 then
@@ -60,7 +68,22 @@ if opt.seed ~= 0 then
   cutorch.manualSeed(opt.seed)
 end
 
-function plot_training_progress(prefix, stats)
+
+local function save_model_weights(cfg, m)
+  local name ='nn.SpatialConvolution'
+  local count =0
+  for k,conv in pairs(m:findModules(name)) do
+    assert(torch.type(conv) == 'nn.SpatialConvolution', "Expecting nn.SpatialConvolution")
+    local weight = conv.weight:view(conv.nOutputPlane, conv.nInputPlane * conv.kH * conv.kW)
+    local filters = image.toDisplayTensor{input=weight, padding=2, nrow=math.ceil(math.sqrt(weight:size(1))), scaleeach=true, symmetric=false}
+    image.save(paths.concat(opt.resultDir, string.format('filters_color_%d.png',count)), filters)
+    --local weight = conv._conv.weight:view(-1, unpack(conv._kernel_size))
+    --local filters = image.toDisplayTensor{input=weight, padding=2, nrow=math.ceil(math.sqrt(weight:size(1))), scaleeach=true, symmetric=false}
+    --image.save(paths.concat(opt.savePath, 'filters_gray.png'), filters)
+    count = count +1
+  end
+end
+local function plot_training_progress(prefix, stats)
   local fn_p = string.format('%s/%sproposal_progress.png',opt.resultDir,prefix)
   local fn_d = string.format('%s/%sdetection_progress.png',opt.resultDir,prefix)
   gnuplot.pngfigure(fn_p)
@@ -70,10 +93,11 @@ function plot_training_progress(prefix, stats)
 
   gnuplot.plot(
     --{ 'preg', xs, torch.Tensor(stats.preg), '-' },
-    { 'pcls', xs, torch.Tensor(stats.pcls), '-' }
+    { 'pcls', xs, torch.Tensor(stats.pcls), '-' },
+    { 'train acc', xs, torch.Tensor(stats.train_acc), '-' }
   )
 
-  gnuplot.axis({ 0, #stats.pcls, 0, 10 })
+  --gnuplot.axis({ 0, #stats.pcls, 0, 1 })
   gnuplot.xlabel('iteration')
   gnuplot.ylabel('loss')
 
@@ -91,17 +115,18 @@ function plot_training_progress(prefix, stats)
   gnuplot.ylabel('loss')
   --]]
   gnuplot.plotflush()
+  
 end
 
-function load_model(cfg, model_path, network_filename, cuda)
+local function load_model(cfg, model_path, network_filename, cuda)
 
   -- get configuration & model
   local model_factory = dofile(model_path)
   local model = model_factory(cfg)
   graph.dot(model.pnet.fg, 'pnet',string.format('%s/pnet_fg',opt.resultDir))
   graph.dot(model.pnet.bg, 'pnet',string.format('%s/pnet_bg',opt.resultDir))
+  model.cnet = nil
   if cuda then
-    model.cnet:cuda()
     model.pnet:cuda()
   end
 
@@ -116,8 +141,113 @@ function load_model(cfg, model_path, network_filename, cuda)
 
   return model, weights, gradient, training_stats
 end
+local function evaluation(model, training_data,optimState,epoch)
+  local batch_iterator = BatchIterator.new(model, training_data)
 
-function graph_training(cfg, model_path, snapshot_prefix, training_data_filename, network_filename)
+  local red = torch.Tensor({1,0,0})
+  local green = torch.Tensor({0,1,0})
+  local blue = torch.Tensor({0,0,1})
+  local white = torch.Tensor({1,1,1})
+  local colors = { red, green, blue, white }
+
+  -- create detector
+  local d = Detector(model)
+
+  for i=1,20 do
+
+    --print(string.format('[Main:evaluation] iteration: %d',i))
+    -- pick random validation image
+    local b = batch_iterator:nextValidation(1)[1]
+    local img = b.img:cuda()
+    local matches = d:detect(img)
+
+    --print(matches)
+    if color_space == 'yuv' then
+      img = image.yuv2rgb(img)
+    elseif color_space == 'lab' then
+      img = image.lab2rgb(img)
+    elseif color_space == 'hsv' then
+      img = image.hsv2rgb(img)
+    end
+    -- draw bounding boxes and save image
+    for i,m in ipairs(matches) do
+      draw_rectangle(img, m.r, green)
+    end
+    for ii = 1,#b.rois do
+      draw_rectangle(img, b.rois[ii].rect, white)
+    end
+
+    image.saveJPG(string.format('%s/output%d.jpg',opt.resultDir, i), img)
+  end
+
+  local save = opt.resultDir
+  local base64im_p= ''
+  local base64im_d = ''
+  do
+    os.execute(('openssl base64 -in %s/%sproposal_progress.png -out %s/imgnet_proposal_progress.base64'):format(save,opt.name,save,opt.name))
+    local f_p = io.open(save..'/imgnet_proposal_progress.base64')
+    if f_p then base64im_p = f_p:read'*all' end
+  end
+  local file = io.open(string.format('%s/report.html',opt.resultDir),'w')
+  file:write(([[
+    <!DOCTYPE html>
+    <html>
+    <body>
+    <title>%s - %s</title>
+    <img src="data:image/png;base64,%s">
+    ]]):format(save,epoch,base64im_p))
+  file:write'<h4>Data configuration:</h4>\n'
+  file:write'<table>\n'
+  if cfg then
+    for k,v in pairs(cfg) do
+      if torch.type(v) == 'number' then
+        file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
+      end
+    end
+  end
+  file:write'</table>\n'
+  file:write'<h4>Options:</h4>\n'
+  file:write'<table>\n'
+  if opt then
+    for k,v in pairs(opt) do
+      if torch.type(v) == 'number' then
+        file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
+      end
+    end
+  end
+  file:write'</table>\n'
+  file:write'<h4>optimState:</h4>\n'
+  file:write'<table>\n'
+  file:write(string.format('%s \n',opt.opti))
+  for k,v in pairs(optimState) do
+    if torch.type(v) == 'number' then
+      file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
+    end
+  end
+  file:write'</table>\n'
+  file:write'<table>\n'
+  for i =1,20 do
+    file:write(string.format('<tr><img src="output%d.jpg" alt="output" width="244" height="244" ></tr>\n',i))
+  end
+  file:write'</table>\n'
+    file:write'<table>\n'
+  for i =0,14 do
+    file:write(string.format('<tr><img src="filters_color_%d.png" alt="filter" width="244" height="244" ></tr>\n',i))
+  end
+  file:write'</table>\n'
+  file:write'<pre>\n'
+  file:write(string.format('Training pcls %s\n',opt.model))
+  file:write(tostring(confusion)..'\n')
+  file:write'</pre>\n'
+  file:write(string.format('<td>%s<img src="%s.svg" alt="%s" width="300" height="600" ></td>\n','cnet_fg','cnet_fg','cnet_fg'))
+  file:write(string.format('<td>%s<img src="%s.svg" alt="%s" width="300" height="600" ></td>\n','cnet_bg','cnet_bg','cnet_bg'))
+  file:write(string.format('<td>%s<img src="%s.svg" alt="%s" width="300" height="600" ></td>\n','pnet_fg','pnet_fg','pnet_fg'))
+  file:write(string.format('<td>%s<img src="%s.svg" alt="%s" width="300" height="600" ></td>\n','pnet_bg','pnet_bg','pnet_bg'))
+  file:write'</tr></body></html>'
+  file:close()
+end
+
+local function graph_training(cfg, model_path, snapshot_prefix, training_data_filename, network_filename)
   local training_data = load_obj(training_data_filename)
   local file_names = keys(training_data.ground_truth)
   print(string.format("Training data loaded. Dataset: '%s'; Total files: %d; classes: %d; Background: %d)",
@@ -129,47 +259,79 @@ function graph_training(cfg, model_path, snapshot_prefix, training_data_filename
   -- create/load model
   local model, weights, gradient, training_stats = load_model(cfg, model_path, network_filename, true)
   if not training_stats then
-    training_stats = { pcls={}, preg={}, dcls={}, dreg={} }
+    training_stats = { pcls={}, preg={}, dcls={}, dreg={}, train_acc={} }
   end
 
   local batch_iterator = BatchIterator.new(model, training_data)
   local eval_objective_grad = create_objective(model, weights, gradient, batch_iterator, training_stats,confusion)
 
-  local rmsprop_state = { learningRate = opt.lr, alpha = opt.rms_decay }
-  --local nag_state = { learningRate = opt.lr, weightDecay = 0, momentum = opt.rms_decay }
-  --local sgd_state = { learningRate = opt.lr, weightDecay = 0.0005, momentum = 0.9 }
+
+
+  print(sys.COLORS.red .. string.format('==> configuring optimizer: %s',opt.opti))
+  local optimState, optimMethod
+  if opt.opti == 'sgd' then
+    optimState = {
+      name = 'sgd',
+      learningRate = opt.lr,
+      weightDecay = 5e-4,
+      momentum = 0.9,
+      learningRateDecay = 1e-7
+    }
+    optimMethod = optim.sgd
+  elseif opt.opti == 'asgd' then
+    optimState = {
+      name = 'asgd',
+      eta0 = opt.lr,
+      lambda = opt.rms_decay
+    }
+    optimMethod = optim.asgd
+  elseif opt.opti == 'rmsprop' then
+    optimState = {
+      name = 'rmsprop',
+      learningRate = opt.lr,
+      weightDecay = opt.rms_decay
+    }
+    optimMethod = optim.rmsprop
+
+  else
+    error('unknown optimization method')
+  end
 
   for i=1,50000 do
     if i % 5000 == 0 then
       opt.lr = opt.lr / 2
-      rmsprop_state.learningRate = opt.lr
+      optimState.learningRate = opt.lr
 
     end
 
     local timer = torch.Timer()
-    local _, loss = optim.rmsprop(eval_objective_grad, weights, rmsprop_state)
-    --local _, loss = optim.nag(eval_objective_grad, weights, nag_state)
-    --local _, loss = optim.sgd(eval_objective_grad, weights, sgd_state)
-    --confusion:batchAdd(outputs, targets)
-    --confusion:updateValids()
 
+    local _, loss = optimMethod(eval_objective_grad, weights, optimState)
 
     local time = timer:time().real
 
     print(string.format('[Main:graph_training] %d: loss: %f', i, loss[1]))
 
     if i%opt.plot == 0 then
+      save_model_weights(cfg, model.pnet)
       confusion:updateValids()
       local train_acc = confusion.totalValid * 100
       print(string.format('[Main:graph_training] Train accuracy: '..c.cyan'%.2f ',train_acc))
       print(confusion)
-      confusion:zero()
+
+      trainLogger:add{['% mean class accuracy (train set)'] = train_acc,
+        ['avg loss (train set)'] = loss[1]}
       plot_training_progress(snapshot_prefix, training_stats)
-      evaluation( model, training_data,rmsprop_state,i)
-      graph.dot(model.cnet.fg, 'cnet',string.format('%s/cnet_fg',opt.resultDir))
-      graph.dot(model.cnet.bg, 'cnet',string.format('%s/cnet_bg',opt.resultDir))
-      --graph.dot(model.pnet.fg, 'pnet','logs/pnet_fg')
-      --graph.dot(model.pnet.bg, 'pnet','logs/pnet_bg')
+      evaluation( model, training_data,optimState,i)
+      if model.cnet then
+        graph.dot(model.cnet.fg, 'cnet',string.format('%s/cnet_fg',opt.resultDir))
+        graph.dot(model.cnet.bg, 'cnet',string.format('%s/cnet_bg',opt.resultDir))
+      end
+      if model.pnet then
+        graph.dot(model.pnet.fg, 'pnet','logs/pnet_fg')
+        graph.dot(model.pnet.bg, 'pnet','logs/pnet_bg')
+      end
+      confusion:zero()
     end
 
     if i%opt.snapshot == 0 then
@@ -182,7 +344,7 @@ function graph_training(cfg, model_path, snapshot_prefix, training_data_filename
   -- compute positive anchors, add anchors to ground-truth file
 end
 
-function load_image_auto_size(fn, target_smaller_side, max_pixel_size, color_space)
+local function load_image_auto_size(fn, target_smaller_side, max_pixel_size, color_space)
   local img = image.load(path.join(base_path, fn), 3, 'float')
   local dim = img:size()
 
@@ -208,141 +370,6 @@ function load_image_auto_size(fn, target_smaller_side, max_pixel_size, color_spa
   end
 
   return img, dim
-end
-
-function evaluation(model, training_data,optimState,epoch)
-  local batch_iterator = BatchIterator.new(model, training_data)
-
-  local red = torch.Tensor({1,0,0})
-  local green = torch.Tensor({0,1,0})
-  local blue = torch.Tensor({0,0,1})
-  local white = torch.Tensor({1,1,1})
-  local colors = { red, green, blue, white }
-
-  -- create detector
-  local d = Detector(model)
-
-  for i=1,20 do
-
-    --print(string.format('[Main:evaluation] iteration: %d',i))
-    -- pick random validation image
-    local b = batch_iterator:nextValidation(1)[1]
-    local img = b.img:cuda()
-    local matches = d:detect(img)
-    --print(matches)
-    if color_space == 'yuv' then
-      img = image.yuv2rgb(img)
-    elseif color_space == 'lab' then
-      img = image.lab2rgb(img)
-    elseif color_space == 'hsv' then
-      img = image.hsv2rgb(img)
-    end
-    -- draw bounding boxes and save image
-    for i,m in ipairs(matches) do
-      draw_rectangle(img, m.r, green)
-    end
-    for ii = 1,#b.rois do
-      draw_rectangle(img, b.rois[ii].rect, white)
-    end
-
-    image.saveJPG(string.format('%s/output%d.jpg',opt.resultDir, i), img)
-    local save = opt.resultDir
-    local base64im_p
-    local base64im_d = ''
-    do
-      os.execute(('openssl base64 -in %s/%sproposal_progress.png -out %s/imgnet_proposal_progress.base64'):format(save,opt.name,save,opt.name))
-      local f_p = io.open(save..'/imgnet_proposal_progress.base64')
-      if f_p then base64im_p = f_p:read'*all' end
-    end
-    local file = io.open(string.format('%s/report.html',opt.resultDir),'w')
-    file:write(([[
-    <!DOCTYPE html>
-    <html>
-    <body>
-    <title>%s - %s</title>
-    <img src="data:image/png;base64,%s">
-    <h4>optimState:</h4>
-    <table>
-    ]]):format(save,epoch,base64im_p))
-    if cfg then
-      for k,v in pairs(cfg) do
-        if torch.type(v) == 'number' then
-          file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
-        end
-      end
-    end
-    file:write'\n'
-    if opt then
-      for k,v in pairs(opt) do
-        if torch.type(v) == 'number' then
-          file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
-        end
-      end
-    end
-    file:write'\n'
-    for k,v in pairs(optimState) do
-      if torch.type(v) == 'number' then
-        file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
-      end
-    end
-    file:write'<table>\n'
-    for i =1,20 do
-      file:write(string.format('<tr><img src="output%d.jpg" alt="output" width="244" height="244" ></tr>\n',i))
-    end
-    file:write'</table>\n'
-    file:write'</table><tr>\n'
-    --file:write(tostring(confusion)..'\n')
-    file:write(string.format('<td>%s<img src="%s.svg" alt="%s" width="300" height="600" ></td>\n','cnet_fg','cnet_fg','cnet_fg'))
-    file:write(string.format('<td>%s<img src="%s.svg" alt="%s" width="300" height="600" ></td>\n','cnet_bg','cnet_bg','cnet_bg'))
-    file:write(string.format('<td>%s<img src="%s.svg" alt="%s" width="300" height="600" ></td>\n','pnet_fg','pnet_fg','pnet_fg'))
-    file:write(string.format('<td>%s<img src="%s.svg" alt="%s" width="300" height="600" ></td>\n','pnet_bg','pnet_bg','pnet_bg'))
-    file:write'</tr></body></html>'
-    file:close()
-  end
-
-end
-
-
-function evaluation_demo(cfg, model_path, training_data_filename, network_filename)
-  -- load trainnig data
-  local training_data = load_obj(training_data_filename)
-
-  -- load model
-  local model = load_model(cfg, model_path, network_filename, true)
-  local batch_iterator = BatchIterator.new(model, training_data)
-
-  local red = torch.Tensor({1,0,0})
-  local green = torch.Tensor({0,1,0})
-  local blue = torch.Tensor({0,0,1})
-  local white = torch.Tensor({1,1,1})
-  local colors = { red, green, blue, white }
-
-  -- create detector
-  local d = Detector(model)
-
-  for i=1,20 do
-
-    -- pick random validation image
-    local b = batch_iterator:nextValidation(1)[1]
-    local img = b.img:cuda()
-    print(string.format('iteration: %d',i))
-    local matches = d:detect(img)
-    if color_space == 'yuv' then
-      img = image.yuv2rgb(img)
-    elseif color_space == 'lab' then
-      img = image.lab2rgb(img)
-    elseif color_space == 'hsv' then
-      img = image.hsv2rgb(img)
-    end
-
-    -- draw bounding boxes and save image
-    for i,m in ipairs(matches) do
-      draw_rectangle(img, m.r, green)
-    end
-
-    image.saveJPG(string.format('%s/output%d.jpg',opt.resultDir, i), img)
-  end
-
 end
 
 graph_training(cfg, opt.model, opt.name, opt.train, opt.restore)

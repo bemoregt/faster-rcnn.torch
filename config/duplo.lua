@@ -1,10 +1,10 @@
  local duplo_cfg = {
   class_count = 16,  -- excluding background class
   target_smaller_side = 224,
-  scales = { 16,32, 64}, 
+  scales = {  32,64,128,200}, 
   max_pixel_size = 1000,
   normalization = { method = nil, width = 7, centering = false, scaling = false },
-  augmentation = { vflip = 0.5, hflip = 0.5, random_scaling = 0.0, aspect_jitter = 0.0 },
+  augmentation = { vflip = 0.0, hflip = 0.0, random_scaling = 0.0, aspect_jitter = 0.0 },
   color_space = 'rgb',
   roi_pooling = { kw = 6, kh = 6 },
   examples_base_path = '/data/brickset_all/',

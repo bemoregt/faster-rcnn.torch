@@ -1,17 +1,18 @@
-require 'torch'
-require 'pl'
-require 'optim'
-require 'image'
-require 'nngraph'
-require 'cunn'
-require 'nms'
-require 'gnuplot'
+local torch = require 'torch'
+local pl = require 'pl'
+local optim = require 'optim'
+local image = require 'image'
+local nngraph = require 'nngraph'
+local cunn = require 'cunn'
+local gnuplot = require 'gnuplot'
 
 require 'utilities'
 require 'Anchors'
 require 'BatchIterator'
 require 'objective'
 require 'Detector'
+require 'nms'
+
 local c = require 'trepl.colorize'
 
 -- command line options
@@ -172,7 +173,7 @@ function graph_training(cfg, model_path, snapshot_prefix, training_data_filename
   else
     error('unknown optimization method')
   end
-  local rmsprop_state = { learningRate = opt.lr, alpha = opt.rms_decay }
+  -- local rmsprop_state = { learningRate = opt.lr, alpha = opt.rms_decay }
   --local nag_state = { learningRate = opt.lr, weightDecay = 0, momentum = opt.rms_decay }
   --local sgd_state = { learningRate = opt.lr, learningRateDecay= 1e-4,weightDecay = 0.0, momentum = 0.90 }
 
@@ -308,6 +309,22 @@ function evaluation(model, training_data,optimState,epoch)
     <h4>optimState:</h4>
     <table>
     ]],save,epoch,base64im_p,base64im_d))
+    if cfg then
+      for k,v in pairs(cfg) do
+        if torch.type(v) == 'number' then
+          file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
+        end
+      end
+    end
+    file:write'\n'
+    if opt then
+      for k,v in pairs(opt) do
+        if torch.type(v) == 'number' then
+          file:write('<tr><td>'..k..'</td><td>'..v..'</td></tr>\n')
+        end
+      end
+    end
+    file:write'\n'
     if optimState then
       for k,v in pairs(optimState) do
         if torch.type(v) == 'number' then
@@ -321,7 +338,7 @@ function evaluation(model, training_data,optimState,epoch)
     end
     file:write'</table>\n'
     file:write'<pre>\n'
-    file:write'Training pcls\n'
+    file:write(string.format('Training pcls %s\n',opt.model))
     file:write(tostring(confusion_pcls)..'\n')
     file:write'</pre>\n'
     file:write'<pre>\n'
@@ -338,48 +355,6 @@ function evaluation(model, training_data,optimState,epoch)
 
 end
 
-
-function evaluation_demo(cfg, model_path, training_data_filename, network_filename)
-  -- load trainnig data
-  local training_data = load_obj(training_data_filename)
-
-  -- load model
-  local model = load_model(cfg, model_path, network_filename, true)
-  local batch_iterator = BatchIterator.new(model, training_data)
-
-  local red = torch.Tensor({1,0,0})
-  local green = torch.Tensor({0,1,0})
-  local blue = torch.Tensor({0,0,1})
-  local white = torch.Tensor({1,1,1})
-  local colors = { red, green, blue, white }
-
-  -- create detector
-  local d = Detector(model)
-
-  for i=1,20 do
-
-    -- pick random validation image
-    local b = batch_iterator:nextValidation(1)[1]
-    local img = b.img:cuda()
-    print(string.format('iteration: %d',i))
-    local matches = d:detect(img)
-    if color_space == 'yuv' then
-      img = image.yuv2rgb(img)
-    elseif color_space == 'lab' then
-      img = image.lab2rgb(img)
-    elseif color_space == 'hsv' then
-      img = image.hsv2rgb(img)
-    end
-
-    -- draw bounding boxes and save image
-    for i,m in ipairs(matches) do
-      draw_rectangle(img, m.r, green)
-    end
-
-    image.saveJPG(string.format('%s/output%d.jpg',opt.resultDir, i), img)
-  end
-
-end
 
 graph_training(cfg, opt.model, opt.name, opt.train, opt.restore)
 --evaluation_demo(cfg, opt.model, opt.train, opt.restore)

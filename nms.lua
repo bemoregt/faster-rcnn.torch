@@ -91,7 +91,7 @@ function nms(boxes, overlap, scores)
     
     -- IoU := i / (area(a) + area(b) - i)
     xx1:index(area, 1, I) -- load remaining areas into xx1
-    torch.cdiv(IoU, inter, xx1 + area[i] - inter) -- store result in iou
+    torch.cdiv(IoU, inter, xx1 + area[i] - inter) -- store result in IoU
     
     I = I[IoU:le(overlap)] -- keep only elements with a IoU < overlap 
   end
