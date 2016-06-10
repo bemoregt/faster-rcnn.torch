@@ -1,0 +1,12 @@
+by Gromit Park
+bemore@gmail.com
+
+2016.06.10.fri.pm
+
+South Korea
+
+FRCNN torch version code
+
+forked for test & update
+
+Thanks ~
